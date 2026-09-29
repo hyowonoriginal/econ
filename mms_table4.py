@@ -98,12 +98,15 @@ def hazard(beta, c, shock, T):
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
-COLUMN_ALIASES = {"std_yyyy": "group", "screen_month": "month", "n_screened": "n"}
+COLUMN_ALIASES = {"std_yyyy": "group", "screen_month": "month", "woy": "month", "n_screened": "n"}
 
 
-def load_counts(data, T=12):
+def load_counts(data, T=None):
     """
     Long data (group, month, n) -> DataFrame indexed by group, columns 1..T.
+
+    `month` is the period index (month 1..12, or week of year `woy` 1..52).
+    T (deadline period) defaults to the last period in the data.
 
     `data` is a file path (.csv, tab-separated .txt/.tsv, or .xlsx) or a DataFrame.
     Columns std_yyyy / screen_month / n_screened are accepted as group / month / n.
@@ -118,6 +121,7 @@ def load_counts(data, T=12):
     if "group" not in df.columns:
         df["group"] = "all"
     wide = df.pivot_table(index="group", columns="month", values="n", aggfunc="sum")
+    T = int(df["month"].max()) if T is None else T
     wide = wide.reindex(columns=range(1, T + 1), fill_value=0).fillna(0)
 
     if "N_eligible" in df.columns:
@@ -235,7 +239,7 @@ def table4(counts, specs=TABLE4_SPECS):
             "c": f"{mod.theta[1]:.3f}",
             "  (se) ": f"({mod.se[1]:.3f})",
             "Shock variance": var_label,
-            "Observations (months)": f"{mod.T}",
+            "Observations (periods)": f"{mod.T}",
             "Individuals": f"{int(mod.n_people):,}",
             "Log-likelihood": f"{mod.ll:,.2f}",
         }
@@ -258,7 +262,7 @@ def simulate_counts(beta, c, N=100_000, T=12, dist="logistic", var_mult=1.0, gro
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", help="CSV with columns group, month, n")
-    ap.add_argument("--T", type=int, default=12, help="deadline month (default 12)")
+    ap.add_argument("--T", type=int, help="deadline period (default: last period in data; 12 for simulation)")
     ap.add_argument("--by-group", action="store_true", help="also estimate each group separately")
     ap.add_argument("--out", help="save Table 4 as CSV")
     args = ap.parse_args()
@@ -267,6 +271,7 @@ def main():
         wide = load_counts(args.data, args.T)
     else:
         print("No --data given: running on simulated data (beta=0.75, c=2.5, logistic).\n")
+        args.T = args.T or 12
         sim = simulate_counts(0.75, 2.5, T=args.T)
         wide = pd.DataFrame(sim, index=[f"sim{g}" for g in range(len(sim))],
                             columns=range(1, args.T + 1))
