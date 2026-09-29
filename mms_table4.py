@@ -10,7 +10,8 @@ Setting (MMS Table 4 / Heidhues & Strack 2021, Lemma 1)
 - Default (MMS Table 4): everyone completes by the deadline T (p_T = 1).
 - Optional (MMS Online Appendix A.6.1 / HS penalty): with the number of eligible
   people given, some never complete. Not completing by T gives utility y_{T+1}
-  (HS's penalty), estimated as a third parameter.
+  (HS's penalty), either estimated as a third parameter or fixed by assumption
+  (y_{T+1} = 0: an optional task, HS Section I).
 
 Naive beliefs (perceived continuation value, exponential self):
     U_T = E[y] = -c,   U_t = E[max(y, U_{t+1})].
@@ -179,11 +180,15 @@ class Table4Model:
 
     eligible: None -> MMS Table 4 (p_T = 1, screened people only).
               array of eligible people per group -> never-screened people are
-              included and the penalty y_{T+1} is estimated too.
+              included.
+    penalty:  with eligible, None -> estimate y_{T+1}; a number -> fix y_{T+1}
+              (0 = optional task). Fixing it identifies c even at beta = 1.
     """
 
-    def __init__(self, counts, dist="logistic", var_mult=1.0, beta_max=1.0, eligible=None):
+    def __init__(self, counts, dist="logistic", var_mult=1.0, beta_max=1.0, eligible=None,
+                 penalty=None):
         self.beta_max = beta_max
+        self.fixed_penalty = penalty
         counts = np.atleast_2d(np.asarray(counts, dtype=float))
         self.T = counts.shape[1]
         self.shock = Shock(dist, var_mult)
@@ -236,22 +241,34 @@ class Table4Model:
         pairs = [(float(np.clip(b, 0.05, 1.5)), a), (0.8, 0.2), (0.5, 2.5)]
         if self.mandatory:
             return [np.array(p) for p in pairs]
+        if self.fixed_penalty is not None:
+            return [np.array([b, c]) for b in (pairs[0][0], 0.8, 0.5) for c in (-2.0, 0.0, 2.0, 5.0)]
         logodds_T = s_eq * np.log(self.stay[-1] / self.n[-1])
         return [np.array([b, a, (logodds_T - a) / b]) for b, a in pairs]
+
+    def unpack(self, th):
+        """Native parameter vector -> (beta, a, d) with a = (1-beta) c, d = y_{T+1} + c."""
+        if self.mandatory:
+            return th[0], th[1], None
+        if self.fixed_penalty is not None:  # th = (beta, c)
+            beta, c = th
+            return beta, (1 - beta) * c, self.fixed_penalty + c
+        return th[0], th[1], th[2]
 
     def fit(self, start=None):
         """
         MLE with beta restricted to (0, beta_max].
 
-        Estimated as (beta, a[, d]) with a = (1 - beta) c and d = y_{T+1} + c, then
-        c = a / (1 - beta) and y_{T+1} = d - c. This keeps the problem well behaved
-        near beta = 1: if beta hits the bound beta_max = 1, a and d are still
-        estimated but c = a / 0 diverges (reported as +/-inf).
+        Native parameters: (beta, a) if mandatory, (beta, a, d) if y_{T+1} is
+        estimated, (beta, c) if y_{T+1} is fixed; a = (1 - beta) c, d = y_{T+1} + c.
+        With a free or no penalty, c = a / (1 - beta) diverges if beta hits the
+        bound beta_max = 1 (reported as +/-inf); a fixed penalty avoids this.
         """
         bmax = self.beta_max
         starts = self.start_values() if start is None else [np.asarray(start, float)]
         k = len(starts[0])
-        negll = lambda th: -self.loglik_a(*th) / self.n_people  # scaled for the optimizer
+        nll = lambda th: -self.loglik_a(*self.unpack(th))
+        negll = lambda th: nll(th) / self.n_people  # scaled for the optimizer
         bounds = [(1e-3, bmax)] + [(None, None)] * (k - 1)
         best = None
         for x0 in starts:
@@ -264,22 +281,29 @@ class Table4Model:
                 best = res
         x = best.x.copy()
         self.at_bound = bmax - x[0] < 1e-6
-        full_negll = lambda th: -self.loglik_a(*th)
-        V = np.zeros((k, k))  # covariance of (beta, a[, d])
+        V = np.zeros((k, k))  # covariance of the native parameters
         if self.at_bound:
             # beta on the upper bound: no standard error for beta.
             x[0] = bmax
-            H = numerical_hessian(lambda z: full_negll(np.r_[bmax, z]), x[1:])
-            V[1:, 1:] = np.linalg.inv(H)
+            V[1:, 1:] = np.linalg.inv(numerical_hessian(lambda z: nll(np.r_[bmax, z]), x[1:]))
         else:
-            V = np.linalg.inv(numerical_hessian(full_negll, x))
+            V = np.linalg.inv(numerical_hessian(nll, x))
         sd = lambda g: float(np.sqrt(g @ V @ g))
 
-        beta, a = x[0], x[1]
+        beta, a, d = self.unpack(x)
         self.est = x
-        self.ll = self.loglik_a(*x)
-        self.a, self.se_a = a, np.sqrt(V[1, 1])
+        self.ll = self.loglik_a(beta, a, d)
         se_b = np.nan if self.at_bound else np.sqrt(V[0, 0])
+        if self.fixed_penalty is not None:
+            c = x[1]
+            g_c = np.array([0.0, 1.0])
+            g_a = np.array([-c, 1 - beta])  # a = (1 - beta) c
+            self.a, self.se_a = a, sd(g_a)
+            self.d, self.se_d = d, sd(g_c)
+            self.penalty, self.se_penalty = self.fixed_penalty, np.nan
+            self.theta, self.se = np.array([beta, c]), np.array([se_b, sd(g_c)])
+            return self
+        self.a, self.se_a = a, np.sqrt(V[1, 1])
         if abs(1 - beta) < 1e-6:
             c, se_c = np.copysign(np.inf, a), np.nan  # c = a / 0 diverges: not identified
         else:
@@ -289,11 +313,11 @@ class Table4Model:
         self.theta = np.array([beta, c])
         self.se = np.array([se_b, se_c])
         if not self.mandatory:
-            self.d, self.se_d = x[2], np.sqrt(V[2, 2])
+            self.d, self.se_d = d, np.sqrt(V[2, 2])
             if np.isinf(c):
                 self.penalty, self.se_penalty = -c, np.nan
             else:
-                self.penalty, self.se_penalty = x[2] - c, sd(np.r_[0, 0, 1] - g_c)
+                self.penalty, self.se_penalty = d - c, sd(np.r_[0, 0, 1] - g_c)
         return self
 
     def predicted_hazard(self):
@@ -325,11 +349,13 @@ def fmt(x, paren=False):
     return f"({x:.3f})" if paren else f"{x:.3f}"
 
 
-def table4(counts, specs=TABLE4_SPECS, beta_max=1.0, eligible=None, participation=None):
+def table4(counts, specs=TABLE4_SPECS, beta_max=1.0, eligible=None, participation=None,
+           penalty=None):
     """
     MMS Table 4 columns. By default p_T = 1 (screened people only).
     Give `eligible` (people eligible per group) or `participation` (screened /
-    eligible, e.g. 0.52) to include never-screened people and estimate y_{T+1}.
+    eligible, e.g. 0.52) to include never-screened people. Then y_{T+1} is
+    estimated, or fixed at `penalty` (0 = optional task).
     """
     counts = np.atleast_2d(np.asarray(counts, dtype=float))
     if participation is not None:
@@ -337,7 +363,7 @@ def table4(counts, specs=TABLE4_SPECS, beta_max=1.0, eligible=None, participatio
     cols = {}
     fits = {}
     for k, (dist, m) in enumerate(specs, start=1):
-        mod = Table4Model(counts, dist, m, beta_max, eligible).fit()
+        mod = Table4Model(counts, dist, m, beta_max, eligible, penalty).fit()
         fits[k] = mod
         var_label = "pi^2/3" if m == 1 else f"{m} x pi^2/3"
         col = {
@@ -389,6 +415,8 @@ def main():
     ap.add_argument("--beta-max", type=float, default=1.0, help="upper bound on beta (default 1)")
     ap.add_argument("--participation", type=float,
                     help="screened / eligible (e.g. 0.52): include never-screened people")
+    ap.add_argument("--penalty", type=float,
+                    help="fix y_{T+1} (e.g. 0 for an optional task); default: estimate it")
     ap.add_argument("--by-group", action="store_true", help="also estimate each group separately")
     ap.add_argument("--out", help="save Table 4 as CSV")
     args = ap.parse_args()
@@ -408,7 +436,8 @@ def main():
     print("Empirical conditional hazard (pooled):")
     print(pd.Series(empirical_hazard(wide.values), index=wide.columns).round(4).to_string(), "\n")
 
-    tab, fits = table4(wide.values, beta_max=args.beta_max, participation=args.participation)
+    tab, fits = table4(wide.values, beta_max=args.beta_max, participation=args.participation,
+                       penalty=args.penalty)
     print("Table 4 (pooled):")
     print(tab.to_string())
     if args.out:
@@ -418,7 +447,7 @@ def main():
         for g, row in wide.iterrows():
             print(f"\nTable 4 — group {g}:")
             print(table4(row.values[None, :], beta_max=args.beta_max,
-                         participation=args.participation)[0].to_string())
+                         participation=args.participation, penalty=args.penalty)[0].to_string())
 
 
 if __name__ == "__main__":
