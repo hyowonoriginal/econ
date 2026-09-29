@@ -7,7 +7,10 @@ Setting (MMS Table 4 / Heidhues & Strack 2021, Lemma 1)
 - Payoff of completing the task in period t: y_t = -c + eta_t, eta_t iid with CDF F
   (eta = eps(1) - eps(0), mean 0). With delta = 1 the benefit b_i (and its timing k_i)
   drops out, so only beta and c are estimated.
-- Everyone completes by the deadline T (p_T = 1).
+- Default (MMS Table 4): everyone completes by the deadline T (p_T = 1).
+- Optional (MMS Online Appendix A.6.1 / HS penalty): with the number of eligible
+  people given, some never complete. Not completing by T gives utility y_{T+1}
+  (HS's penalty), estimated as a third parameter.
 
 Naive beliefs (perceived continuation value, exponential self):
     U_T = E[y] = -c,   U_t = E[max(y, U_{t+1})].
@@ -19,10 +22,14 @@ With logistic scale 1, W_{t+1} = ln(T - t), so
     p_t = 1 / (1 + exp((1 - beta) c) * (T - t)^beta),
 which is MMS eq. (3) with delta = 1.
 
+With a finite penalty the same recursion starts one period later from
+    W_{T+1} = d := y_{T+1} + c,
+and p_T = 1 - F((1 - beta) c + beta d) < 1. The mandatory case is d = -inf.
+
 Data
 ----
-Long CSV with columns `group, month, n`: number of people screened in each month,
-by group (e.g. year). Months run 1..T (T = 12 by default).
+Long CSV with columns `group, month, n`: number of people screened in each period,
+by group (e.g. year). Periods are months (1..12) or weeks (`woy`, may start at 0).
 """
 
 import argparse
@@ -76,10 +83,20 @@ class Shock:
         return s * (np.exp(-0.5 * z * z) / np.sqrt(2 * np.pi) - z * special.ndtr(-z))
 
 
-def naive_W(shock, T):
-    """W_1..W_T from W_T = 0, W_t = W_{t+1} + E[(eta - W_{t+1})^+]. Index 0 = month 1."""
-    W = np.zeros(T)
-    for t in range(T - 2, -1, -1):
+def naive_W(shock, T, d=None):
+    """
+    Naive continuation values W_t = U_t + c, index 0 = period 1.
+
+    Mandatory task (d None): W_1..W_T with W_T = 0.
+    Finite penalty: W_1..W_{T+1} with W_{T+1} = d = y_{T+1} + c.
+    Recursion: W_t = W_{t+1} + E[(eta - W_{t+1})^+].
+    """
+    if d is None:
+        W = np.zeros(T)
+    else:
+        W = np.empty(T + 1)
+        W[T] = d
+    for t in range(len(W) - 2, -1, -1):
         W[t] = W[t + 1] + shock.expected_excess(W[t + 1])
     return W
 
@@ -89,10 +106,12 @@ def thresholds(beta, c, W):
     return (1.0 - beta) * c + beta * W[1:]
 
 
-def hazard(beta, c, shock, T):
-    """Conditional completion probability p_1..p_T (p_T = 1)."""
-    W = naive_W(shock, T)
-    return np.append(shock.sf(thresholds(beta, c, W)), 1.0)
+def hazard(beta, c, shock, T, penalty=None):
+    """Conditional completion probability p_1..p_T (p_T = 1 unless a finite penalty y_{T+1})."""
+    if penalty is None:
+        W = naive_W(shock, T)
+        return np.append(shock.sf(thresholds(beta, c, W)), 1.0)
+    return shock.sf(thresholds(beta, c, naive_W(shock, T, penalty + c)))
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +124,8 @@ def load_counts(data, T=None):
     """
     Long data (group, month, n) -> DataFrame indexed by group, columns 1..T.
 
-    `month` is the period index (month 1..12, or week of year `woy` 1..52).
-    T (deadline period) defaults to the last period in the data.
+    `month` is the period index (month 1..12, or week of year `woy` 0..52).
+    Periods run from the first period in the data to T (default: the last one).
 
     `data` is a file path (.csv, tab-separated .txt/.tsv, or .xlsx) or a DataFrame.
     Columns std_yyyy / screen_month / n_screened are accepted as group / month / n.
@@ -121,16 +140,17 @@ def load_counts(data, T=None):
     if "group" not in df.columns:
         df["group"] = "all"
     wide = df.pivot_table(index="group", columns="month", values="n", aggfunc="sum")
+    first = int(df["month"].min())
     T = int(df["month"].max()) if T is None else T
-    wide = wide.reindex(columns=range(1, T + 1), fill_value=0).fillna(0)
+    wide = wide.reindex(columns=range(first, T + 1), fill_value=0).fillna(0)
 
     if "N_eligible" in df.columns:
         # p_T = 1 assumes everyone in the sample is screened by month T.
         eligible = df.groupby("group")["N_eligible"].first()
         gap = eligible - wide.sum(axis=1)
         for g, k in gap[gap > 0].items():
-            print(f"Warning: group {g} has {int(k):,} eligible people never screened; "
-                  "they are dropped (p_T = 1 uses screened people only).")
+            print(f"Note: group {g} has {int(k):,} eligible people never screened. "
+                  "Pass eligible=... (or participation=...) to table4 to include them.")
     return wide
 
 
@@ -154,96 +174,132 @@ def empirical_hazard(counts):
 # ---------------------------------------------------------------------------
 class Table4Model:
     """
-    Pooled MLE of (beta, c) with delta = 1. Groups share parameters, so the
-    pooled log-likelihood is the sum over groups (same as MMS pooling 2005-2007).
+    Pooled MLE with delta = 1. Groups share parameters, so the pooled
+    log-likelihood is the sum over groups (same as MMS pooling 2005-2007).
+
+    eligible: None -> MMS Table 4 (p_T = 1, screened people only).
+              array of eligible people per group -> never-screened people are
+              included and the penalty y_{T+1} is estimated too.
     """
 
-    def __init__(self, counts, dist="logistic", var_mult=1.0, beta_max=1.0):
+    def __init__(self, counts, dist="logistic", var_mult=1.0, beta_max=1.0, eligible=None):
         self.beta_max = beta_max
         counts = np.atleast_2d(np.asarray(counts, dtype=float))
         self.T = counts.shape[1]
         self.shock = Shock(dist, var_mult)
-        self.W = naive_W(self.shock, self.T)
-        R = risk_sets(counts)
-        # Month T contributes log(1) = 0 because p_T = 1.
-        self.n = counts[:, :-1].sum(axis=0)
-        self.stay = (R[:, :-1] - counts[:, :-1]).sum(axis=0)
-        self.n_people = counts.sum()
+        self.mandatory = eligible is None
+        if self.mandatory:
+            self.W = naive_W(self.shock, self.T)
+            R = risk_sets(counts)
+            # Period T contributes log(1) = 0 because p_T = 1.
+            self.n = counts[:, :-1].sum(axis=0)
+            self.stay = (R[:, :-1] - counts[:, :-1]).sum(axis=0)
+            self.n_people = counts.sum()
+            self.never = 0.0
+        else:
+            eligible = np.broadcast_to(np.asarray(eligible, dtype=float), counts.shape[:1])
+            if np.any(eligible < counts.sum(axis=1)):
+                raise ValueError("eligible is smaller than the number screened")
+            R = eligible[:, None] - (np.cumsum(counts, axis=1) - counts)
+            self.n = counts.sum(axis=0)
+            self.stay = (R - counts).sum(axis=0)  # period T: never screened
+            self.n_people = eligible.sum()
+            self.never = self.stay[-1]
+
+    def W_for(self, d=None):
+        return self.W if self.mandatory else naive_W(self.shock, self.T, d)
 
     def loglik(self, theta):
-        beta, c = theta
-        x = thresholds(beta, c, self.W)
+        """theta = (beta, c) or (beta, c, y_{T+1})."""
+        beta, c = theta[:2]
+        d = None if self.mandatory else theta[2] + c
+        return self.loglik_a(beta, (1 - beta) * c, d)
+
+    def loglik_a(self, beta, a, d=None):
+        """Log-likelihood in terms of beta, a = (1 - beta) c and d = y_{T+1} + c."""
+        x = a + beta * self.W_for(d)[1:]
         return np.sum(self.n * self.shock.logsf(x) + self.stay * self.shock.logcdf(x))
 
     def start_values(self):
         """
-        OLS on the logistic closed form: log-odds of waiting = (1-beta) c + beta W_{t+1}.
-        For other distributions, approximate by a logistic with the same variance.
+        Starting (beta, a[, d]) list. (beta, a) from OLS on the logistic closed form
+        (log-odds of waiting = a + beta W_{t+1}, mandatory W, periods before T),
+        approximating other distributions by a logistic with the same variance.
+        d is then set so that period T's hazard matches the data.
         """
-        n, stay = self.n, self.stay
-        ok = (n > 0) & (stay > 0)
         s_eq = np.sqrt(self.shock.var / LOGISTIC_VAR)
-        y = s_eq * np.log(stay[ok] / n[ok])
-        X = np.column_stack([np.ones(ok.sum()), self.W[1:][ok]])
-        a, b = np.linalg.lstsq(X, y, rcond=None)[0]
-        beta = float(np.clip(b, 0.05, 1.5))
-        c = a / (1 - beta) if abs(1 - beta) > 1e-3 else 0.0
-        return np.array([beta, c])
-
-    def loglik_a(self, beta, a):
-        """Log-likelihood in terms of beta and the intercept a = (1 - beta) c."""
-        x = a + beta * self.W[1:]
-        return np.sum(self.n * self.shock.logsf(x) + self.stay * self.shock.logcdf(x))
+        W0 = naive_W(self.shock, self.T)
+        n, stay = self.n[: self.T - 1], self.stay[: self.T - 1]
+        ok = (n > 0) & (stay > 0)
+        X = np.column_stack([np.ones(ok.sum()), W0[1:][ok]])
+        a, b = np.linalg.lstsq(X, s_eq * np.log(stay[ok] / n[ok]), rcond=None)[0]
+        pairs = [(float(np.clip(b, 0.05, 1.5)), a), (0.8, 0.2), (0.5, 2.5)]
+        if self.mandatory:
+            return [np.array(p) for p in pairs]
+        logodds_T = s_eq * np.log(self.stay[-1] / self.n[-1])
+        return [np.array([b, a, (logodds_T - a) / b]) for b, a in pairs]
 
     def fit(self, start=None):
         """
         MLE with beta restricted to (0, beta_max].
 
-        Estimated as (beta, a) with a = (1 - beta) c, then c = a / (1 - beta).
-        This keeps the problem well behaved near beta = 1: if beta hits the bound
-        beta_max = 1, a is still estimated but c = a / 0 diverges (reported as NaN).
+        Estimated as (beta, a[, d]) with a = (1 - beta) c and d = y_{T+1} + c, then
+        c = a / (1 - beta) and y_{T+1} = d - c. This keeps the problem well behaved
+        near beta = 1: if beta hits the bound beta_max = 1, a and d are still
+        estimated but c = a / 0 diverges (reported as +/-inf).
         """
         bmax = self.beta_max
-        b0, c0 = self.start_values() if start is None else np.asarray(start, float)
+        starts = self.start_values() if start is None else [np.asarray(start, float)]
+        k = len(starts[0])
         negll = lambda th: -self.loglik_a(*th) / self.n_people  # scaled for the optimizer
-        bounds = [(1e-3, bmax), (None, None)]
+        bounds = [(1e-3, bmax)] + [(None, None)] * (k - 1)
         best = None
-        for b, a in [(b0, (1 - b0) * c0), (0.8, 0.2), (0.5, 2.5)]:
-            x0 = np.array([np.clip(b, 0.01, bmax - 0.01), a])
+        for x0 in starts:
+            x0 = np.r_[np.clip(x0[0], 0.01, bmax - 0.01), x0[1:]]
             res = optimize.minimize(negll, x0, method="Nelder-Mead", bounds=bounds,
-                                    options={"xatol": 1e-10, "fatol": 1e-14, "maxiter": 20000})
+                                    options={"xatol": 1e-10, "fatol": 1e-14, "maxiter": 40000})
             res = optimize.minimize(negll, res.x, method="L-BFGS-B", bounds=bounds,
                                     options={"ftol": 1e-15, "gtol": 1e-10})
             if best is None or res.fun < best.fun:
                 best = res
-        beta, a = best.x
-        self.at_bound = bmax - beta < 1e-6
+        x = best.x.copy()
+        self.at_bound = bmax - x[0] < 1e-6
         full_negll = lambda th: -self.loglik_a(*th)
+        V = np.zeros((k, k))  # covariance of (beta, a[, d])
         if self.at_bound:
-            # beta on the upper bound: no standard error for beta, only for a.
-            beta = bmax
-            h = numerical_hessian(lambda x: full_negll([beta, x[0]]), np.array([a]))
-            se_b, se_a, cov_ba = np.nan, float(np.sqrt(1.0 / h[0, 0])), 0.0
+            # beta on the upper bound: no standard error for beta.
+            x[0] = bmax
+            H = numerical_hessian(lambda z: full_negll(np.r_[bmax, z]), x[1:])
+            V[1:, 1:] = np.linalg.inv(H)
         else:
-            cov = np.linalg.inv(numerical_hessian(full_negll, np.array([beta, a])))
-            se_b, se_a, cov_ba = np.sqrt(cov[0, 0]), np.sqrt(cov[1, 1]), cov[0, 1]
-        self.ll = self.loglik_a(beta, a)
-        self.a, self.se_a = a, se_a
+            V = np.linalg.inv(numerical_hessian(full_negll, x))
+        sd = lambda g: float(np.sqrt(g @ V @ g))
+
+        beta, a = x[0], x[1]
+        self.est = x
+        self.ll = self.loglik_a(*x)
+        self.a, self.se_a = a, np.sqrt(V[1, 1])
+        se_b = np.nan if self.at_bound else np.sqrt(V[0, 0])
         if abs(1 - beta) < 1e-6:
             c, se_c = np.copysign(np.inf, a), np.nan  # c = a / 0 diverges: not identified
         else:
             c = a / (1 - beta)
-            # delta method: dc/dbeta = a / (1-beta)^2, dc/da = 1 / (1-beta)
-            g = np.array([a / (1 - beta) ** 2, 1 / (1 - beta)])
-            V = np.array([[0.0 if np.isnan(se_b) else se_b ** 2, cov_ba], [cov_ba, se_a ** 2]])
-            se_c = float(np.sqrt(g @ V @ g))
+            g_c = np.r_[a / (1 - beta) ** 2, 1 / (1 - beta), np.zeros(k - 2)]  # delta method
+            se_c = sd(g_c)
         self.theta = np.array([beta, c])
         self.se = np.array([se_b, se_c])
+        if not self.mandatory:
+            self.d, self.se_d = x[2], np.sqrt(V[2, 2])
+            if np.isinf(c):
+                self.penalty, self.se_penalty = -c, np.nan
+            else:
+                self.penalty, self.se_penalty = x[2] - c, sd(np.r_[0, 0, 1] - g_c)
         return self
 
     def predicted_hazard(self):
-        beta = self.theta[0]
-        return np.append(self.shock.sf(self.a + beta * self.W[1:]), 1.0)
+        d = None if self.mandatory else self.d
+        p = self.shock.sf(self.a + self.theta[0] * self.W_for(d)[1:])
+        return np.append(p, 1.0) if self.mandatory else p
 
 
 def numerical_hessian(f, x, rel_step=1e-4):
@@ -269,14 +325,22 @@ def fmt(x, paren=False):
     return f"({x:.3f})" if paren else f"{x:.3f}"
 
 
-def table4(counts, specs=TABLE4_SPECS, beta_max=1.0):
+def table4(counts, specs=TABLE4_SPECS, beta_max=1.0, eligible=None, participation=None):
+    """
+    MMS Table 4 columns. By default p_T = 1 (screened people only).
+    Give `eligible` (people eligible per group) or `participation` (screened /
+    eligible, e.g. 0.52) to include never-screened people and estimate y_{T+1}.
+    """
+    counts = np.atleast_2d(np.asarray(counts, dtype=float))
+    if participation is not None:
+        eligible = counts.sum(axis=1) / participation
     cols = {}
     fits = {}
     for k, (dist, m) in enumerate(specs, start=1):
-        mod = Table4Model(counts, dist, m, beta_max).fit()
+        mod = Table4Model(counts, dist, m, beta_max, eligible).fit()
         fits[k] = mod
         var_label = "pi^2/3" if m == 1 else f"{m} x pi^2/3"
-        cols[f"({k})"] = {
+        col = {
             "Shock distribution": dist.capitalize(),
             "beta": fmt(mod.theta[0]),
             "  (se)": fmt(mod.se[0], paren=True),
@@ -285,18 +349,30 @@ def table4(counts, specs=TABLE4_SPECS, beta_max=1.0):
             "  (se) ": fmt(mod.se[1], paren=True),
             "(1-beta) c": fmt(mod.a),
             "  (se)  ": fmt(mod.se_a, paren=True),
+        }
+        if not mod.mandatory:
+            col.update({
+                "y_{T+1} (never screened)": fmt(mod.penalty),
+                "  (se)   ": fmt(mod.se_penalty, paren=True),
+                "y_{T+1} + c": fmt(mod.d),
+                "  (se)    ": fmt(mod.se_d, paren=True),
+            })
+        col.update({
             "Shock variance": var_label,
             "Observations (periods)": f"{mod.T}",
-            "Individuals": f"{int(mod.n_people):,}",
+            "Individuals": f"{int(round(mod.n_people)):,}",
+            "Never screened": f"{mod.never / mod.n_people:.1%}",
             "Log-likelihood": f"{mod.ll:,.2f}",
-        }
+        })
+        cols[f"({k})"] = col
     return pd.DataFrame(cols), fits
 
 
-def simulate_counts(beta, c, N=100_000, T=12, dist="logistic", var_mult=1.0, groups=3, seed=0):
-    """Draw monthly counts from the model (for checking the estimator)."""
+def simulate_counts(beta, c, N=100_000, T=12, dist="logistic", var_mult=1.0, groups=3, seed=0,
+                    penalty=None):
+    """Draw counts per period from the model (for checking the estimator). N = eligible per group."""
     rng = np.random.default_rng(seed)
-    p = hazard(beta, c, Shock(dist, var_mult), T)
+    p = hazard(beta, c, Shock(dist, var_mult), T, penalty)
     out = np.zeros((groups, T), dtype=int)
     for g in range(groups):
         left = N
@@ -311,6 +387,8 @@ def main():
     ap.add_argument("--data", help="CSV with columns group, month, n")
     ap.add_argument("--T", type=int, help="deadline period (default: last period in data; 12 for simulation)")
     ap.add_argument("--beta-max", type=float, default=1.0, help="upper bound on beta (default 1)")
+    ap.add_argument("--participation", type=float,
+                    help="screened / eligible (e.g. 0.52): include never-screened people")
     ap.add_argument("--by-group", action="store_true", help="also estimate each group separately")
     ap.add_argument("--out", help="save Table 4 as CSV")
     args = ap.parse_args()
@@ -323,13 +401,14 @@ def main():
         sim = simulate_counts(0.75, 2.5, T=args.T)
         wide = pd.DataFrame(sim, index=[f"sim{g}" for g in range(len(sim))],
                             columns=range(1, args.T + 1))
+        args.participation = None
 
-    print("Monthly counts:")
+    print("Counts per period:")
     print(wide.astype(int).to_string(), "\n")
     print("Empirical conditional hazard (pooled):")
     print(pd.Series(empirical_hazard(wide.values), index=wide.columns).round(4).to_string(), "\n")
 
-    tab, fits = table4(wide.values, beta_max=args.beta_max)
+    tab, fits = table4(wide.values, beta_max=args.beta_max, participation=args.participation)
     print("Table 4 (pooled):")
     print(tab.to_string())
     if args.out:
@@ -338,7 +417,8 @@ def main():
     if args.by_group:
         for g, row in wide.iterrows():
             print(f"\nTable 4 — group {g}:")
-            print(table4(row.values[None, :], beta_max=args.beta_max)[0].to_string())
+            print(table4(row.values[None, :], beta_max=args.beta_max,
+                         participation=args.participation)[0].to_string())
 
 
 if __name__ == "__main__":
