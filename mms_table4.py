@@ -98,13 +98,35 @@ def hazard(beta, c, shock, T):
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
-def load_counts(path, T=12):
-    """Read long CSV (group, month, n) -> DataFrame indexed by group, columns 1..T."""
-    df = pd.read_csv(path)
+COLUMN_ALIASES = {"std_yyyy": "group", "screen_month": "month", "n_screened": "n"}
+
+
+def load_counts(data, T=12):
+    """
+    Long data (group, month, n) -> DataFrame indexed by group, columns 1..T.
+
+    `data` is a file path (.csv, tab-separated .txt/.tsv, or .xlsx) or a DataFrame.
+    Columns std_yyyy / screen_month / n_screened are accepted as group / month / n.
+    """
+    if isinstance(data, pd.DataFrame):
+        df = data.copy()
+    elif str(data).endswith((".xlsx", ".xls")):
+        df = pd.read_excel(data)
+    else:
+        df = pd.read_csv(data, sep=None, engine="python")  # detects comma or tab
+    df = df.rename(columns=COLUMN_ALIASES)
     if "group" not in df.columns:
         df["group"] = "all"
     wide = df.pivot_table(index="group", columns="month", values="n", aggfunc="sum")
     wide = wide.reindex(columns=range(1, T + 1), fill_value=0).fillna(0)
+
+    if "N_eligible" in df.columns:
+        # p_T = 1 assumes everyone in the sample is screened by month T.
+        eligible = df.groupby("group")["N_eligible"].first()
+        gap = eligible - wide.sum(axis=1)
+        for g, k in gap[gap > 0].items():
+            print(f"Warning: group {g} has {int(k):,} eligible people never screened; "
+                  "they are dropped (p_T = 1 uses screened people only).")
     return wide
 
 
