@@ -77,10 +77,11 @@ def fit(df, dist, m, ybar, starts=None):
             return b, c, -c
         return b, c, (xT - c) / b if ybar == "mms" else k * (th[2] if ybar == "free" else ybar)
 
-    def ll(th):
+    def cutoff(th):  # p_t = 1 - F(cutoff), log(1 - p_t) = logsf(-cutoff)
         b, c, y = params(th)
-        x = (1 - b) * c + b * W(y + c)
-        return np.sum(n * logsf(x) + s * logsf(-x))
+        return (1 - b) * c + b * W(y + c)
+
+    ll = lambda th: np.sum(n * logsf(x := cutoff(th)) + s * logsf(-x))
 
     starts = starts or ([[b] for b in (0.3, 0.6, 1, 1.5, 2)] if ybar == "mms" else
                         [[b, c] for b in (0.3, 0.6, 1, 1.5, 2) for c in (0, 3, 8)])
@@ -91,7 +92,9 @@ def fit(df, dist, m, ybar, starts=None):
     b, c, y = params(th)
     return {"beta": b, "se(beta)": se[0], "delta": 1, "c": c, "se(c)": se[1], "ybar": np.nan if mand else y, "se(ybar)": se[2],
             "Shock variance (x pi^2/3)": m, "Observations": df.t.nunique(), "Individuals": N,
-            "Never screened": 1 - df.CNT_INDI.sum() / N, "Log-likelihood": ll(th)}
+            "Never screened": 1 - df.CNT_INDI.sum() / N,
+            "Never screened (model)": 0.0 if mand else np.exp(logsf(-cutoff(th)).sum()),  # prod_t (1 - p_t)
+            "Log-likelihood": ll(th)}
 
 
 def table4(df):
