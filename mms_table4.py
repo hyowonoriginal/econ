@@ -57,8 +57,11 @@ def hessian(f, x, h=1e-4):
                       for j in E] for i in E])
 
 
-def fit(df, dist, m, ybar=None, starts=None):
-    """ybar None: p_T = 1. A number: fixed ybar (x sqrt(m)). "free": estimated, from `starts`."""
+def fit(df, dist, m, ybar=None, starts=None, c_fix=None):
+    """
+    ybar None: p_T = 1. A number: fixed ybar (x sqrt(m)). "free": estimated, from `starts`.
+    "mms" (MMS A.6.1): c fixed at c_fix, ybar matches the December hazard; only beta estimated.
+    """
     logsf, excess = shock(dist, m)
     mand, k = ybar is None, np.sqrt(m)  # theta holds a, c, ybar in units of k
     d = (df[df.r > 0] if mand else df).groupby("r", as_index=False)[["CNT_INDI", "AMONG_SCREEN", "NEVER"]].sum()
@@ -72,7 +75,12 @@ def fit(df, dist, m, ybar=None, starts=None):
             W.append(W[-1] + excess(W[-1]))
         return np.array(W)[R]
 
+    if ybar == "mms":  # December cutoff with 1 - F(xT) = observed December hazard
+        xT = optimize.brentq(lambda x: logsf(x) - np.log(n[R == 0].sum() / (n + s)[R == 0].sum()), -1e4, 1e4)
+
     def cutoff(th):  # p_t = 1 - F(cutoff)
+        if ybar == "mms":  # theta = (beta,); December cutoff c + beta ybar = xT
+            return (1 - th[0]) * c_fix + th[0] * W((xT - c_fix) / th[0] + c_fix)
         if mand:  # theta = (beta, a / k), a = (1 - beta) c
             return k * th[1] + th[0] * W(0.0)
         b, c = th[0], k * th[1]
@@ -82,6 +90,8 @@ def fit(df, dist, m, ybar=None, starts=None):
     if mand:  # start: logistic approximation, log-odds of waiting = a + beta w
         ok, w = (n > 0) & (s > 0), W(0.0) / k
         starts = [np.linalg.lstsq(np.c_[w, np.ones(len(w))][ok], np.log(s / n)[ok], rcond=None)[0]]
+    elif ybar == "mms":
+        starts = [[b] for b in (0.3, 0.6, 1, 1.5, 2)]
     elif starts is None:
         starts = [[b, c] for b in (0.3, 0.6, 1, 1.5, 2) for c in (0, 3, 8)]
     res = [optimize.minimize(lambda th: -ll(th) / N, x0, method="BFGS", options={"gtol": 1e-10}) for x0 in starts]
@@ -94,6 +104,8 @@ def fit(df, dist, m, ybar=None, starts=None):
         b, a = th
         g = k * np.array([a, 1 - b]) / (1 - b) ** 2  # gradient of c = k a / (1 - beta)
         out |= {"c": k * a / (1 - b), "se(c)": np.sqrt(g @ V @ g)}
+    elif ybar == "mms":
+        out |= {"c": c_fix, "se(c)": np.nan, "ybar": (xT - c_fix) / th[0], "se(ybar)": np.nan}
     else:
         free = ybar == "free"
         out |= {"c": k * th[1], "se(c)": se[1], "ybar": k * (th[2] if free else ybar),
@@ -111,6 +123,7 @@ def table4(df):
             k = np.sqrt(m)
             res["ybar free"] = fit(df, dist, m, "free", [[r["beta"], r["c"] / k, r["ybar"] / k] for r in fixed.values()])
             res |= fixed
+            res["MMS A.6.1"] = fit(df, dist, m, "mms", c_fix=res["p_T = 1"]["c"])
         cols[f"({j}) {dist}"] = pd.concat({v: pd.Series(r) for v, r in res.items()})
     return pd.DataFrame(cols)
 
