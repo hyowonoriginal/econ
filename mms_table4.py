@@ -9,7 +9,8 @@ Self t screens iff eta_t >= (1 - beta) c + beta W(T - t):
     p_t = 1 - F((1 - beta) c + beta W(T - t)).
 NEVER = screened (1/q - 1) people per year never screen, so
     logL = sum_t CNT_INDI_t log p_t + (AMONG_SCREEN_t + NEVER) log(1 - p_t).
-Models: "MMS A.6.1" (c = C_FIX, ybar set so the last week's hazard is matched, only beta estimated),
+Models: "p_T = 1" (MMS Table 4: no never-screened, everyone screened by T, last week dropped,
+W(0) = 0 at T - 1), "MMS A.6.1" (c = C_FIX, ybar set so the last week's hazard is matched, only beta estimated),
 "ybar free" (beta, c, ybar estimated), "ybar = y" (ybar fixed at YBARS).
 c, ybar and C_FIX are in units of sqrt(m), so columns with the same distribution give the same beta.
 
@@ -55,12 +56,13 @@ def hessian(f, x, h=1e-4):
 
 
 def fit(df, dist, m, ybar, starts=None):
-    """ybar: a number (fixed), "free" (estimated from `starts`) or "mms" (MMS A.6.1)."""
+    """ybar: None (p_T = 1), a number (fixed), "free" (estimated from `starts`) or "mms" (MMS A.6.1)."""
     logsf, excess = shock(dist, m)
     k = np.sqrt(m)  # theta = (beta, c / k, ybar / k), as many as are estimated
-    d = df.groupby("r", as_index=False)[["CNT_INDI", "AMONG_SCREEN", "NEVER"]].sum()  # pool years
-    n, s, r = d.CNT_INDI.values, (d.AMONG_SCREEN + d.NEVER).values, d.r.values
-    N = df.CNT_INDI.sum() + df.groupby("YEAR").NEVER.first().sum()
+    mand = ybar is None
+    d = (df[df.r > 0] if mand else df).groupby("r", as_index=False)[["CNT_INDI", "AMONG_SCREEN", "NEVER"]].sum()
+    n, s, r = d.CNT_INDI.values, (d.AMONG_SCREEN + (0 if mand else d.NEVER)).values, d.r.values - mand
+    N = df.CNT_INDI.sum() + (0 if mand else df.groupby("YEAR").NEVER.first().sum())
     xT = optimize.brentq(lambda x: logsf(x) - np.log(n[0] / (n[0] + s[0])), -1e4, 1e4)  # last-week cutoff
 
     def W(w0):
@@ -69,8 +71,10 @@ def fit(df, dist, m, ybar, starts=None):
             W.append(W[-1] + excess(W[-1]))
         return np.array(W)[r]
 
-    def params(th):  # (beta, c, ybar); MMS: c + beta ybar = xT
+    def params(th):  # (beta, c, ybar); MMS: c + beta ybar = xT; p_T = 1: ybar = -c gives W(0) = 0
         b, c = th[0], k * (C_FIX if ybar == "mms" else th[1])
+        if mand:
+            return b, c, -c
         return b, c, (xT - c) / b if ybar == "mms" else k * (th[2] if ybar == "free" else ybar)
 
     def ll(th):
@@ -85,7 +89,7 @@ def fit(df, dist, m, ybar, starts=None):
     se = np.sqrt(np.diag(np.linalg.pinv(-hessian(ll, th)))) * np.r_[1, k, k][:len(th)]
     se = np.r_[se, [np.nan] * (3 - len(th))]
     b, c, y = params(th)
-    return {"beta": b, "se(beta)": se[0], "delta": 1, "c": c, "se(c)": se[1], "ybar": y, "se(ybar)": se[2],
+    return {"beta": b, "se(beta)": se[0], "delta": 1, "c": c, "se(c)": se[1], "ybar": np.nan if mand else y, "se(ybar)": se[2],
             "Shock variance (x pi^2/3)": m, "Observations": df.t.nunique(), "Individuals": N,
             "Never screened": 1 - df.CNT_INDI.sum() / N, "Log-likelihood": ll(th)}
 
@@ -94,8 +98,9 @@ def table4(df):
     cols = {}
     for j, (dist, m) in enumerate(SPECS, 1):
         k = np.sqrt(m)
-        res = {"MMS A.6.1": fit(df, dist, m, "mms")} | {f"ybar = {y}": fit(df, dist, m, y) for y in YBARS}
-        starts = [[o["beta"], o["c"] / k, o["ybar"] / k] for o in res.values()]  # free fit starts from the others
+        res = {"p_T = 1": fit(df, dist, m, None), "MMS A.6.1": fit(df, dist, m, "mms")}
+        res |= {f"ybar = {y}": fit(df, dist, m, y) for y in YBARS}
+        starts = [[o["beta"], o["c"] / k, o["ybar"] / k] for v, o in res.items() if v != "p_T = 1"]  # for free fit
         res["ybar free"] = fit(df, dist, m, "free", starts)
         cols[f"({j}) {dist}"] = pd.concat({v: pd.Series(o) for v, o in res.items()})
     return pd.DataFrame(cols)
