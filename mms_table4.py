@@ -27,7 +27,11 @@ def load(data):
         df = data.copy()
     else:
         df = pd.read_excel(data) if data.endswith(".xlsx") else pd.read_csv(data, sep=None, engine="python")
-    df["t"] = df["YYYYMM"] % 100 if "YYYYMM" in df else df["woy"].clip(lower=1)  # week 0 -> week 1
+    df = df.reset_index() if any(df.index.names) else df  # YYYYMM / woy kept as index
+    df.columns = [str(c).strip().lstrip("\ufeff").upper() for c in df.columns]  # BOM, spaces, case
+    if not {"YYYYMM", "WOY"} & set(df.columns):
+        raise KeyError(f"need a YYYYMM or woy column; got {list(df.columns)}")
+    df["t"] = df["YYYYMM"].astype(int) % 100 if "YYYYMM" in df else df["WOY"].astype(int).clip(lower=1)  # week 0 -> week 1
     if "YEAR" not in df:
         df["YEAR"] = "all"
     df = df.groupby(["YEAR", "t"], as_index=False).agg(CNT_INDI=("CNT_INDI", "sum"),
