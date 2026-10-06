@@ -114,7 +114,8 @@ def fit(df, dist, m, ybar=None, starts=None, c_fix=None):
                   "Never screened": 1 - df.CNT_INDI.sum() / N, "Log-likelihood": ll(th)}
 
 
-def table4(df):
+def table4(df, c_fix=None):
+    """c_fix: cost for MMS A.6.1 (x sqrt(m)); None = c from the p_T = 1 fit."""
     cols = {}
     for j, (dist, m) in enumerate(SPECS, 1):
         res = {"p_T = 1": fit(df, dist, m)}
@@ -123,13 +124,13 @@ def table4(df):
             k = np.sqrt(m)
             res["ybar free"] = fit(df, dist, m, "free", [[r["beta"], r["c"] / k, r["ybar"] / k] for r in fixed.values()])
             res |= fixed
-            res["MMS A.6.1"] = fit(df, dist, m, "mms", c_fix=res["p_T = 1"]["c"])
+            res["MMS A.6.1"] = fit(df, dist, m, "mms", c_fix=res["p_T = 1"]["c"] if c_fix is None else c_fix * np.sqrt(m))
         cols[f"({j}) {dist}"] = pd.concat({v: pd.Series(r) for v, r in res.items()})
     return pd.DataFrame(cols)
 
 
-def run(data, participation=0.52, exclude=2020):
+def run(data, participation=0.52, exclude=2020, c_fix=None):
     """Table 4 for pooled data and, as a robustness check, without the year `exclude`."""
     df = load(data, participation)
     groups = {"pooled": df} | ({f"excl. {exclude}": df[df.YEAR != exclude]} if exclude in set(df.YEAR) else {})
-    return pd.concat({g: table4(d) for g, d in groups.items()}, names=["group", "model", ""])
+    return pd.concat({g: table4(d, c_fix) for g, d in groups.items()}, names=["group", "model", ""])
