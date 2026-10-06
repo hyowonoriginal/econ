@@ -10,11 +10,9 @@ Self t screens iff eta_t >= (1 - beta) c + beta W(T - t - 1):
 AMONG_SCREEN_t is the number still unscreened after t, so
     logL = sum_{t<T} CNT_INDI_t log p_t + AMONG_SCREEN_t log(1 - p_t).
 
-Usage: python mms_table4.py monthly.csv weekly.csv
+Usage: see main.py. run(data) takes a file path or a DataFrame.
 Monthly columns: YYYYMM, CNT_INDI, YEAR, AMONG_SCREEN. Weekly: woy, CNT_INDI, AMONG_SCREEN (YEAR optional).
 """
-import sys
-
 import numpy as np
 import pandas as pd
 from scipy import optimize, special
@@ -24,8 +22,11 @@ SPECS = [("logistic", 1), ("logistic", 5), ("logistic", 25),
          ("normal", 1), ("normal", 5), ("normal", 25)]
 
 
-def load(path):
-    df = pd.read_excel(path) if path.endswith(".xlsx") else pd.read_csv(path, sep=None, engine="python")
+def load(data):
+    if isinstance(data, pd.DataFrame):
+        df = data.copy()
+    else:
+        df = pd.read_excel(data) if data.endswith(".xlsx") else pd.read_csv(data, sep=None, engine="python")
     df["t"] = df["YYYYMM"] % 100 if "YYYYMM" in df else df["woy"].clip(lower=1)  # week 0 -> week 1
     if "YEAR" not in df:
         df["YEAR"] = "all"
@@ -79,11 +80,8 @@ def table4(df):
     return pd.DataFrame({f"({k}) {dist}": fit(df, dist, m) for k, (dist, m) in enumerate(SPECS, 1)})
 
 
-if __name__ == "__main__":
-    pd.set_option("display.float_format", "{:,.3f}".format, "display.width", 250, "display.max_columns", None)
-    for path in sys.argv[1:]:
-        df = load(path)
-        groups = {"pooled": df} | ({y: g for y, g in df.groupby("YEAR")} if df.YEAR.nunique() > 1 else {})
-        out = pd.concat({g: table4(d) for g, d in groups.items()}, names=["group", ""])
-        print(f"\n=== {path} ===\n{out}")
-        out.to_csv(path.rsplit(".", 1)[0] + "_table4.csv")
+def run(data):
+    """Table 4 for pooled data and, if there is more than one YEAR, each year."""
+    df = load(data)
+    groups = {"pooled": df} | ({y: g for y, g in df.groupby("YEAR")} if df.YEAR.nunique() > 1 else {})
+    return pd.concat({g: table4(d) for g, d in groups.items()}, names=["group", ""])
